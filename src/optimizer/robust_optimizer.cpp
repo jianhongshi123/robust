@@ -1712,6 +1712,31 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 	parent->children[0] = std::move(create->children[0]);
 	create->children[0] = (std::move(plan));
 	plan = std::move(beginning);
+	LogicalOperator *cur = plan.get();
+	while(cur->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+		if(auto *createCur = dynamic_cast<LogicalCreateFilter *>(cur)){
+			auto& filter = createCur->filter_operation;
+			createCur->input_bindings.clear();
+			for(auto& baseBinding:filter.build_columns){
+				for(auto& binding:createCur->GetColumnBindings()){
+					if(ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)){
+						createCur->input_bindings.push_back(binding);
+					}
+				}
+			}
+		} else if(auto* probeCur = dynamic_cast<LogicalProbeFilter *>(cur)){
+			auto& filter = probeCur->filter_operation;
+			probeCur->input_bindings.clear();
+			for(auto& baseBinding:filter.probe_columns){
+				for(auto& binding:probeCur->GetColumnBindings()){
+					if(ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)){
+						probeCur->input_bindings.push_back(binding);
+					}
+				}
+			}
+		}
+		cur = cur->children[0].get();
+	}
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<LogicalOperator> plan) {
