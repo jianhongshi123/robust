@@ -798,6 +798,42 @@ vector<PhysicalDAGNode *> RobustOptimizerContextState::BuildPhysicalPlanDAG(Logi
 	return all_nodes;
 }
 
+bool ExistCycle(vector<PhysicalDAGNode *> &all_nodes) {
+	unordered_map<idx_t, bool> visited;
+	for (auto *node : all_nodes) {
+		if (visited.count(node->table_idx)) {
+			continue;
+		}
+		idx_t cntNodes = 0;
+		idx_t cntEdges = 0;
+		vector<PhysicalDAGNode *> que;
+		auto discover = [&](PhysicalDAGNode *candidate) {
+			if (visited.count(candidate->table_idx)) {
+				return;
+			}
+			visited[candidate->table_idx] = true;
+			que.push_back(candidate);
+			cntNodes++;
+			cntEdges += candidate->parents.size() + candidate->children.size();
+		};
+		discover(node);
+		while (!que.empty()) {
+			auto cur = que.back();
+			que.pop_back();
+			for (auto &child : cur->children) {
+				discover(child);
+			}
+			for (auto &parent : cur->parents) {
+				discover(parent);
+			}
+		}
+		if (cntEdges / 2 >= cntNodes) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void RobustOptimizerContextState::FlipRootsToLeaves(vector<PhysicalDAGNode *> &all_nodes) {
 	unordered_map<idx_t, bool> visited;
 	vector<PhysicalDAGComponent> components;
@@ -1722,6 +1758,10 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<Log
 		map<ColKey, ColKey> uf_parent;
 		auto all_nodes = BuildPhysicalPlanDAG(plan.get(), uf_parent);
 
+		if (ExistCycle(all_nodes)) {
+			D_PRINTF("Cycle Detected");
+			return plan;
+		}
 		// flip non-largest roots to leaves (default: on)
 		Value flip_val;
 		bool flip_roots = true;
