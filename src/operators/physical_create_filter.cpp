@@ -413,7 +413,7 @@ static void PushDynamicFilters(const PhysicalCreateFilter &op, const CreateFilte
 
 			// keep BF alongside IN-filter for per-row pruning (IN is zonemap-only);
 			// equality filter already does per-row, skip BF there
-			if (push_bf && !pushed_equal) {
+			if (push_bf && !pushed_equal && target.push_bf_to_scan) {
 				auto bf_it = op.bloom_filter_map.find(build_col);
 				if (bf_it != op.bloom_filter_map.end() && bf_it->second && !bf_it->second->IsEmpty()) {
 					auto bf_filter = make_uniq<BFTableFilter>(bf_it->second->GetNativeFilter(), false,

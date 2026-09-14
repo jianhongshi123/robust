@@ -1659,11 +1659,12 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 				target.probe_column = probe_col;
 				target.column_type = col_type;
 				target.column_name = col_name;
+				target.push_bf_to_scan = !(probe_filter->above_filter);
 				create_filter->pushdown_targets.push_back(std::move(target));
 			}
 
-			// mark PROBE_FILTER as passthrough since filters are pushed to scan
-			probe_filter->is_passthrough = true;
+			// mark PROBE_FILTER as passthrough when filters are pushed to scan
+			probe_filter->is_passthrough = !(probe_filter->above_filter);
 
 			D_PRINTF("[PUSHDOWN] forward CREATE_FILTER (build=table_%llu) -> PROBE_FILTER (probe=table_%llu) pushed "
 			         "%zu targets",
@@ -1793,6 +1794,9 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 				}
 			}
 		} else if (auto *probeCur = dynamic_cast<LogicalProbeFilter *>(cur)) {
+			if (probeCur->filter_operation.is_forward_pass) {
+				probeCur->above_filter = true;
+			}
 			auto &filter = probeCur->filter_operation;
 			probeCur->input_bindings.clear();
 			for (auto &baseBinding : filter.probe_columns) {

@@ -113,6 +113,7 @@ PhysicalOperator &LogicalCreateFilter::CreatePlan(ClientContext &context, Physic
 			phys_target.probe_column = target.probe_column;
 			phys_target.column_type = target.column_type;
 			phys_target.column_name = target.column_name;
+			phys_target.push_bf_to_scan = target.push_bf_to_scan;
 			physical->pushdown_targets.push_back(std::move(phys_target));
 		}
 		physical->is_forward_pass = is_forward_pass;

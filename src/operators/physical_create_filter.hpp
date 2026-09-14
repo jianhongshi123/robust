@@ -91,6 +91,7 @@ public:
 		ColumnBinding probe_column;
 		LogicalType column_type;
 		string column_name;
+		bool push_bf_to_scan = false;
 	};
 	vector<DynamicFilterTarget> pushdown_targets;
 	bool is_forward_pass = false;
