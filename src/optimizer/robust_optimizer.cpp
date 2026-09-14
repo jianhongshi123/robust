@@ -1692,11 +1692,11 @@ static LogicalOperator *FindDeepestCreateFilter(LogicalOperator *node) {
 	return deepest;
 }
 
-// find the deepest CREATE/PROBE FILTER chain starting with a CREATE_FILTER
+// find the deepest CREATE/PROBE FILTER chain
 static pair<LogicalOperator *, LogicalOperator *> FindDeepestFilterChain(LogicalOperator *node) {
 	LogicalOperator *deepest = nullptr;
 	LogicalOperator *parent = nullptr;
-	LogicalOperator *create = nullptr;
+	LogicalOperator *dynamic_filter_op = nullptr;
 	while (node) {
 		if (node->children.size() != 1 || node->children[0]->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
 		    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
@@ -1710,18 +1710,17 @@ static pair<LogicalOperator *, LogicalOperator *> FindDeepestFilterChain(Logical
 				    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 					break;
 				}
-				if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
-				    dynamic_cast<LogicalCreateFilter *>(node)) {
+				if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
 					parent = deepest;
-					create = node;
+					dynamic_filter_op = node;
 				}
 				node = node->children[0].get();
 			}
-			return {parent, create};
+			return {parent, dynamic_filter_op};
 		}
 		node = node->children[0].get();
 	}
-	return {parent, create};
+	return {parent, dynamic_filter_op};
 }
 
 void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<LogicalOperator> &plan) {
@@ -1771,15 +1770,15 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 
 	auto p = FindDeepestFilterChain(plan.get());
 	LogicalOperator *parent = p.first;
-	LogicalOperator *create = p.second;
-	if (!parent || !create) {
+	LogicalOperator *dynamic_filter_op = p.second;
+	if (!parent || !dynamic_filter_op) {
 		return;
 	}
 
 	// lift the CREATE/PROBE FILTER chain above LOGICAL_FILTER and remap the column bindings
 	auto beginning = std::move(parent->children[0]);
-	parent->children[0] = std::move(create->children[0]);
-	create->children[0] = (std::move(plan));
+	parent->children[0] = std::move(dynamic_filter_op->children[0]);
+	dynamic_filter_op->children[0] = (std::move(plan));
 	plan = std::move(beginning);
 	LogicalOperator *cur = plan.get();
 	while (cur->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
