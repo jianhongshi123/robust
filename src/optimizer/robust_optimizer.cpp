@@ -88,7 +88,22 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 		// record base tables that have LOGICAL_FILTERs
 		if (!logical_filter.expressions.empty()) {
 			auto *current = child;
-			while (current->type != LogicalOperatorType::LOGICAL_GET && current->children.size() == 1) {
+			while (true) {
+				if (current->children.size() > 2 || current->children.empty()) {
+					break;
+				} else if (current->children.size() == 2) {
+					if (current->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+						break;
+					}
+					auto &join = current->Cast<LogicalComparisonJoin>();
+					if (join.join_type != JoinType::MARK) {
+						break;
+					}
+				} else if (current->children.size() == 1) {
+					if (current->type == LogicalOperatorType::LOGICAL_GET) {
+						break;
+					}
+				}
 				current = current->children[0].get();
 			}
 			if (current->type == LogicalOperatorType::LOGICAL_GET) {
