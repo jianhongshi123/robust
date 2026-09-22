@@ -26,6 +26,8 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/common/types/hyperloglog.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 
 namespace duckdb {
 // class LogicalCreateFilter;
@@ -1991,6 +1993,65 @@ struct TableFilterState {
 	idx_t source_idx = DConstants::INVALID_INDEX;
 };
 
+static void TightenProbeRange(BaseStatistics &stats, const TableFilter &filter) {
+	if (filter.filter_type == TableFilterType::CONJUNCTION_AND) {
+		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+			TightenProbeRange(stats, *child);
+		}
+		return;
+	}
+	if (filter.filter_type != TableFilterType::CONSTANT_COMPARISON) {
+		return;
+	}
+
+	auto &f = filter.Cast<ConstantFilter>();
+	auto lo = NumericStats::Min(stats);
+	auto hi = NumericStats::Max(stats);
+
+	switch (f.comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		lo = std::max(lo, f.constant);
+		hi = std::min(hi, f.constant);
+		break;
+
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		lo = std::max(lo, f.constant);
+		break;
+
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		hi = std::min(hi, f.constant);
+		break;
+
+	default:
+		return;
+	}
+
+	if (lo <= hi) {
+		NumericStats::SetMin(stats, lo);
+		NumericStats::SetMax(stats, hi);
+	}
+}
+
+void RobustOptimizerContextState::TightenWithLocalPredicate(const ColumnBinding &binding, BaseStatistics &stats) {
+	if (!stats.GetType().IsIntegral() || !NumericStats::HasMinMax(stats)) {
+		return;
+	}
+	auto resolved = ResolveColumnBinding(binding);
+	auto *get = TableManager::FindLogicalGet(table_mgr.table_lookup[resolved.table_index].table_op);
+	if (!get) {
+		D_PRINTF("No matching base table found");
+		return;
+	}
+
+	auto col = get->GetColumnIds()[resolved.column_index].GetPrimaryIndex();
+	auto it = get->table_filters.filters.find(col);
+	if (it != get->table_filters.filters.end()) {
+		TightenProbeRange(stats, *it->second);
+	}
+}
+
 bool RobustOptimizerContextState::HasFilteringLocalPredicate(const FilterOpPair &pair) {
 	const auto &pair_op = pair.probe_op;
 	const auto &build_columns = pair_op.build_columns;
@@ -2027,6 +2088,7 @@ bool RobustOptimizerContextState::HasFilteringLocalPredicate(const FilterOpPair 
 			return true;
 		}
 
+		// check if this local predicate is non-selective
 		ColumnBinding filter_binding(build_table_idx, filter_column_index);
 		auto build_stats = GetColumnStatistics(filter_binding);
 		if (!build_stats) {
@@ -2037,6 +2099,7 @@ bool RobustOptimizerContextState::HasFilteringLocalPredicate(const FilterOpPair 
 			continue;
 		}
 
+		// check if this local predicate is on join key
 		auto resolved_filter_binding = ResolveColumnBinding(filter_binding);
 		idx_t key_index = DConstants::INVALID_INDEX;
 		for (idx_t i = 0; i < build_columns.size(); i++) {
@@ -2053,6 +2116,9 @@ bool RobustOptimizerContextState::HasFilteringLocalPredicate(const FilterOpPair 
 		if (!probe_stats) {
 			return true;
 		}
+
+		TightenWithLocalPredicate(probe_binding, *probe_stats);
+
 		auto probe_result = filter.CheckStatistics(*probe_stats);
 		if (probe_result != FilterPropagateResult::FILTER_ALWAYS_TRUE) {
 			return true;
@@ -2078,6 +2144,8 @@ bool RobustOptimizerContextState::IsRedundant(const FilterOpPair &pair) {
 		if (!NumericStats::HasMinMax(*build_stats) || !NumericStats::HasMinMax(*probe_stats)) {
 			return false;
 		}
+
+		TightenWithLocalPredicate(probe_columns[i], *probe_stats);
 
 		auto build_min = NumericStats::Min(*build_stats).GetValue<int64_t>();
 		auto build_max = NumericStats::Max(*build_stats).GetValue<int64_t>();

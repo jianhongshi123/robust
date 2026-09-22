@@ -138,6 +138,8 @@ public:
 
 	bool HLLDominates(const ColumnBinding &build_binding, const ColumnBinding &probe_binding);
 
+	void TightenWithLocalPredicate(const ColumnBinding &binding, BaseStatistics &stats);
+
 	bool HasFilteringLocalPredicate(const FilterOpPair &pair);
 
 	bool IsRedundant(const FilterOpPair &pair);
