@@ -1891,7 +1891,7 @@ bool RobustOptimizerContextState::HLLDominates(const ColumnBinding &build_bindin
 
 enum class IncomingFilterStatus { NONE, ONE, MULTIPLE };
 
-struct TableFilterState {
+struct FilterTableState {
 	IncomingFilterStatus status = IncomingFilterStatus::NONE;
 	idx_t source_idx = DConstants::INVALID_INDEX;
 };
@@ -2077,11 +2077,11 @@ bool RobustOptimizerContextState::IsRedundant(const FilterOpPair &pair) {
 void RobustOptimizerContextState::RemoveRedundantPairs(
     vector<FilterOpPair> &filter_pairs, unordered_map<LogicalOperator *, vector<FilterOperation>> &forward_filter_ops,
     unordered_map<LogicalOperator *, vector<FilterOperation>> &backward_filter_ops) {
-	map<idx_t, TableFilterState> table_states;
+	map<idx_t, FilterTableState> table_states;
 
 	// initialzize status of tables using local predicates
 	for (const auto &entry : table_mgr.table_lookup) {
-		table_states[entry.first] = TableFilterState();
+		table_states[entry.first] = FilterTableState();
 	}
 	vector<bool> remove_pair(filter_pairs.size(), false);
 
