@@ -45,6 +45,12 @@ struct PhysicalDAGNode {
 	}
 };
 
+struct PhysicalDAGComponent {
+	vector<PhysicalDAGNode *> comp_nodes;
+	vector<PhysicalDAGNode *> roots;
+	PhysicalDAGNode *anchor;
+};
+
 // column key for equivalence class union-find
 using ColKey = std::pair<idx_t, idx_t>; // (table_idx, column_idx)
 
@@ -64,6 +70,8 @@ public:
 	vector<JoinEdge> mst_edges;
 
 	unordered_map<ColumnBinding, ColumnBinding, ColumnBindingHashFunction> rename_col_bindings;
+
+	bool exist_cycle = false;
 
 public:
 	// extract all the join edges from the plan
