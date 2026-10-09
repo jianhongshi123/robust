@@ -2,6 +2,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/types.hpp"
 #include "table_manager.hpp"
@@ -138,6 +139,7 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 	case LogicalOperatorType::LOGICAL_GET:
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+	case LogicalOperatorType::LOGICAL_CTE_REF:
 		D_PRINTF("[NODE_REG] Registering base table scan, type=%d", (int)op->type);
 		table_mgr.AddTableOperator(op);
 		return;
@@ -175,8 +177,29 @@ ColumnBinding RobustOptimizerContextState::ResolveColumnBinding(const ColumnBind
 	return current;
 }
 
+static idx_t TableUFFind(unordered_map<idx_t, idx_t> &parent, idx_t x) {
+	if (parent.find(x) == parent.end()) {
+		parent[x] = x;
+	}
+	while (parent[x] != x) {
+		parent[x] = parent[parent[x]];
+		x = parent[x];
+	}
+	return x;
+}
+
+static void TableUFUnion(unordered_map<idx_t, idx_t> &parent, idx_t a, idx_t b) {
+	a = TableUFFind(parent, a);
+	b = TableUFFind(parent, b);
+	if (a != b) {
+		parent[a] = b;
+	}
+}
+
 vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOperator *> &join_ops) {
 	vector<JoinEdge> edges;
+	unordered_map<idx_t, idx_t> table_parent;
+	set<pair<idx_t, idx_t>> seen_pairs;
 	for (auto &op : join_ops) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
 
@@ -215,6 +238,24 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 			} else {
 				D_PRINTF("WARNING: Resolved table indices (%llu, %llu) not found in table_lookup",
 				         (unsigned long long)left_table_idx, (unsigned long long)right_table_idx);
+				continue;
+			}
+			// record whether the join graph is cyclic without short-circuiting, so the
+			// returned edge list stays complete regardless of where a cycle shows up
+			for (idx_t i = 0; i < resolved_left_columns.size(); i++) {
+				auto u = resolved_left_columns[i].table_index;
+				auto v = resolved_right_columns[i].table_index;
+				if (u > v) {
+					std::swap(u, v);
+				}
+				if (!seen_pairs.count({u, v})) {
+					if (TableUFFind(table_parent, u) == TableUFFind(table_parent, v)) {
+						exist_cycle = true;
+					} else {
+						seen_pairs.insert({u, v});
+						TableUFUnion(table_parent, u, v);
+					}
+				}
 			}
 		}
 	}
@@ -613,7 +654,7 @@ static void PhysicalDAGDFS(LogicalOperator *op, TableManager &table_mgr, RobustO
 		     op->type == LogicalOperatorType::LOGICAL_EXPRESSION_GET ||
 		     op->type == LogicalOperatorType::LOGICAL_DELIM_GET ||
 		     op->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT ||
-		     op->type == LogicalOperatorType::LOGICAL_CHUNK_GET);
+		     op->type == LogicalOperatorType::LOGICAL_CHUNK_GET || op->type == LogicalOperatorType::LOGICAL_CTE_REF);
 		if (is_leaf) {
 			auto *node = new PhysicalDAGNode(info->table_idx, info->table_op);
 			all_nodes.push_back(node);
@@ -797,70 +838,108 @@ vector<PhysicalDAGNode *> RobustOptimizerContextState::BuildPhysicalPlanDAG(Logi
 }
 
 void RobustOptimizerContextState::FlipRootsToLeaves(vector<PhysicalDAGNode *> &all_nodes) {
-	// step 1: find all roots
-	vector<PhysicalDAGNode *> roots;
+	unordered_map<idx_t, bool> visited;
+	vector<PhysicalDAGComponent> components;
 	for (auto *node : all_nodes) {
-		if (node->parents.empty()) {
-			roots.push_back(node);
+		// step 1: find all roots
+		if (visited.count(node->table_idx)) {
+			continue;
 		}
-	}
-	if (roots.size() <= 1) {
-		return;
-	}
-
-	// step 2: find anchor root (largest cardinality)
-	PhysicalDAGNode *anchor = roots[0];
-	for (auto *r : roots) {
-		if (r->table_op->estimated_cardinality > anchor->table_op->estimated_cardinality) {
-			anchor = r;
-		}
-	}
-
-	// step 3: repeatedly flip non-anchor roots until only anchor remains
-	// flipping a root can expose new roots (e.g. flipping name reveals aka_name)
-	bool flipped = true;
-	while (flipped) {
-		flipped = false;
-		for (auto *node : all_nodes) {
-			if (!node->parents.empty() || node == anchor) {
-				continue;
+		vector<PhysicalDAGNode *> comp_nodes;
+		vector<PhysicalDAGNode *> roots;
+		PhysicalDAGNode *anchor;
+		vector<PhysicalDAGNode *> que;
+		auto discover = [&](PhysicalDAGNode *candidate) {
+			if (visited.count(candidate->table_idx)) {
+				return;
 			}
-			// non-anchor root: reverse all edges to its children
-			auto children_copy = node->children;
-			for (auto *child : children_copy) {
-				PhysicalDAGEdge edge;
-				bool found = false;
-				for (idx_t i = 0; i < child->parents.size(); i++) {
-					if (child->parents[i] == node) {
-						edge = child->edges_to_parents[i];
-						child->parents.erase(child->parents.begin() + static_cast<std::ptrdiff_t>(i));
-						child->edges_to_parents.erase(child->edges_to_parents.begin() + static_cast<std::ptrdiff_t>(i));
-						found = true;
-						break;
-					}
-				}
-				if (!found) {
+			if (candidate->parents.empty()) {
+				roots.push_back(candidate);
+			}
+			visited[candidate->table_idx] = true;
+			que.push_back(candidate);
+			comp_nodes.push_back(candidate);
+		};
+		discover(node);
+		while (!que.empty()) {
+			auto cur = que.back();
+			que.pop_back();
+			for (auto &child : cur->children) {
+				discover(child);
+			}
+			for (auto &parent : cur->parents) {
+				discover(parent);
+			}
+		}
+
+		// step 2: find anchor root (largest cardinality)
+		if (roots.empty()) {
+			D_PRINTF("ERROR: No root found for this component");
+			continue;
+		}
+		anchor = roots[0];
+		for (auto *r : roots) {
+			if (r->table_op->estimated_cardinality > anchor->table_op->estimated_cardinality) {
+				anchor = r;
+			}
+		}
+		components.push_back({comp_nodes, roots, anchor});
+	}
+	for (auto &comp : components) {
+		auto &comp_nodes = comp.comp_nodes;
+		auto &roots = comp.roots;
+		auto *anchor = comp.anchor;
+		if (roots.size() <= 1) {
+			continue;
+		}
+
+		// step 3: repeatedly flip non-anchor roots until only anchor remains
+		// flipping a root can expose new roots (e.g. flipping name reveals aka_name)
+		bool flipped = true;
+		while (flipped) {
+			flipped = false;
+			for (auto *node : comp_nodes) {
+				if (!node->parents.empty() || node == anchor) {
 					continue;
 				}
-				for (idx_t i = 0; i < node->children.size(); i++) {
-					if (node->children[i] == child) {
-						node->children.erase(node->children.begin() + static_cast<std::ptrdiff_t>(i));
-						break;
+				// non-anchor root: reverse all edges to its children
+				auto children_copy = node->children;
+				for (auto *child : children_copy) {
+					PhysicalDAGEdge edge;
+					bool found = false;
+					for (idx_t i = 0; i < child->parents.size(); i++) {
+						if (child->parents[i] == node) {
+							edge = child->edges_to_parents[i];
+							child->parents.erase(child->parents.begin() + static_cast<std::ptrdiff_t>(i));
+							child->edges_to_parents.erase(child->edges_to_parents.begin() +
+							                              static_cast<std::ptrdiff_t>(i));
+							found = true;
+							break;
+						}
 					}
+					if (!found) {
+						continue;
+					}
+					for (idx_t i = 0; i < node->children.size(); i++) {
+						if (node->children[i] == child) {
+							node->children.erase(node->children.begin() + static_cast<std::ptrdiff_t>(i));
+							break;
+						}
+					}
+					child->children.push_back(node);
+					node->parents.push_back(child);
+
+					PhysicalDAGEdge reversed;
+					reversed.parent_table = edge.child_table;
+					reversed.child_table = edge.parent_table;
+					reversed.parent_cols = edge.child_cols;
+					reversed.child_cols = edge.parent_cols;
+					node->edges_to_parents.push_back(reversed);
+
+					// only mark progress on a real reversal; a childless root cannot
+					// be flipped and must not keep this loop spinning forever
+					flipped = true;
 				}
-				child->children.push_back(node);
-				node->parents.push_back(child);
-
-				PhysicalDAGEdge reversed;
-				reversed.parent_table = edge.child_table;
-				reversed.child_table = edge.parent_table;
-				reversed.parent_cols = edge.child_cols;
-				reversed.child_cols = edge.parent_cols;
-				node->edges_to_parents.push_back(reversed);
-
-				// only mark progress on a real reversal; a childless root cannot
-				// be flipped and must not keep this loop spinning forever
-				flipped = true;
 			}
 		}
 	}
@@ -1571,12 +1650,15 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 static LogicalOperator *FindDeepestCreateFilter(LogicalOperator *node) {
 	LogicalOperator *deepest = nullptr;
 	while (node) {
+		if (node->children.empty()) {
+			break;
+		}
+		if (node->children.size() != 1 || node->GetColumnBindings() != node->children[0]->GetColumnBindings()) {
+			break;
+		}
 		if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
 		    dynamic_cast<LogicalCreateFilter *>(node)) {
 			deepest = node;
-		}
-		if (node->children.empty()) {
-			break;
 		}
 		node = node->children[0].get();
 	}
@@ -1654,11 +1736,18 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<LogicalOperator> plan) {
+	exist_cycle = false;
+
 	// step 1: extract join operators
 	vector<JoinEdge> edges = ExtractOperators(*plan);
 
 	D_PRINTF("Edges size: %zu", edges.size());
 	if (edges.size() <= 1) {
+		return plan;
+	}
+
+	if (exist_cycle) {
+		D_PRINTF("Cycle Detected");
 		return plan;
 	}
 
