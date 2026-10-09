@@ -240,6 +240,8 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 				         (unsigned long long)left_table_idx, (unsigned long long)right_table_idx);
 				continue;
 			}
+			// record whether the join graph is cyclic without short-circuiting, so the
+			// returned edge list stays complete regardless of where a cycle shows up
 			for (idx_t i = 0; i < resolved_left_columns.size(); i++) {
 				auto u = resolved_left_columns[i].table_index;
 				auto v = resolved_right_columns[i].table_index;
@@ -249,15 +251,11 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 				if (!seen_pairs.count({u, v})) {
 					if (TableUFFind(table_parent, u) == TableUFFind(table_parent, v)) {
 						exist_cycle = true;
-						break;
 					} else {
 						seen_pairs.insert({u, v});
 						TableUFUnion(table_parent, u, v);
 					}
 				}
-			}
-			if (exist_cycle) {
-				break;
 			}
 		}
 	}
@@ -1738,6 +1736,8 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<LogicalOperator> plan) {
+	exist_cycle = false;
+
 	// step 1: extract join operators
 	vector<JoinEdge> edges = ExtractOperators(*plan);
 
