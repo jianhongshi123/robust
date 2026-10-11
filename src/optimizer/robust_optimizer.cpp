@@ -1646,120 +1646,93 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 	}
 }
 
-// find the deepest CREATE_FILTER in a linear chain (following child[0])
-static LogicalOperator *FindDeepestCreateFilter(LogicalOperator *node) {
-	LogicalOperator *deepest = nullptr;
-	while (node) {
-		if (node->children.empty()) {
-			break;
-		}
+// DELIM_JOIN and MATERIALIZED_CTE bindings are paired with DELIM_GET / CTE_REF placeholders
+// deeper in the plan, so a chain must never be moved across one
+static bool IsLiftBarrier(const LogicalOperator &op) {
+	return op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+}
+
+// walk the single-child spine from `slot` for as long as bindings pass through unchanged, and
+// report the run ending at the deepest CREATE_FILTER. the run starts at `slot` itself, so any
+// binding-transparent operators sitting above that CREATE_FILTER move along with it.
+static bool FindStableBindingChain(unique_ptr<LogicalOperator> &slot, LiftableChain &result) {
+	LogicalOperator *deepest_create = nullptr;
+	for (auto *node = slot.get(); node; node = node->children[0].get()) {
 		if (node->children.size() != 1 || node->GetColumnBindings() != node->children[0]->GetColumnBindings()) {
 			break;
 		}
 		if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
 		    dynamic_cast<LogicalCreateFilter *>(node)) {
-			deepest = node;
+			deepest_create = node;
 		}
-		node = node->children[0].get();
 	}
-	return deepest;
+	if (!deepest_create) {
+		return false;
+	}
+	result = {&slot, deepest_create};
+	return true;
 }
 
-// find the deepest CREATE/PROBE FILTER chain starting with a CREATE_FILTER
-static pair<LogicalOperator *, LogicalOperator *> FindDeepestFilterChain(LogicalOperator *node) {
-	LogicalOperator *deepest = nullptr;
-	LogicalOperator *parent = nullptr;
-	LogicalOperator *create = nullptr;
-	while (node) {
-		if (node->children.size() != 1 || node->children[0]->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-		    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-			break;
+// walk the single-child spine below `plan` until a run of CREATE/PROBE_FILTER operators is
+// found, and report that run up to its deepest CREATE_FILTER. unlike the stable-binding
+// search this crosses operators that rewrite bindings, so the caller has to remap afterwards.
+static bool FindFilterChain(unique_ptr<LogicalOperator> &plan, LiftableChain &result) {
+	for (auto *node = plan.get(); node;) {
+		if (node->children.size() != 1 || IsLiftBarrier(*node->children[0])) {
+			return false;
 		}
-		if (node->children[0]->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
-			deepest = node;
-			node = node->children[0].get();
-			while (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
-				if (node->children.size() != 1 || node->children[0]->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-				    node->children[0]->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-					break;
-				}
-				if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
-				    dynamic_cast<LogicalCreateFilter *>(node)) {
-					parent = deepest;
-					create = node;
-				}
-				node = node->children[0].get();
+		auto *chain_slot = &node->children[0];
+		if ((*chain_slot)->type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			node = chain_slot->get();
+			continue;
+		}
+		LogicalOperator *deepest_create = nullptr;
+		for (auto *scan = chain_slot->get(); scan->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
+		     scan = scan->children[0].get()) {
+			if (scan->children.size() != 1 || IsLiftBarrier(*scan->children[0])) {
+				break;
 			}
-			return {parent, create};
+			if (dynamic_cast<LogicalCreateFilter *>(scan)) {
+				deepest_create = scan;
+			}
 		}
-		node = node->children[0].get();
+		if (!deepest_create) {
+			return false;
+		}
+		result = {chain_slot, deepest_create};
+		return true;
 	}
-	return {parent, create};
+	return false;
 }
 
-void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<LogicalOperator> &plan) {
-	if (!plan) {
-		return;
-	}
-	for (auto &child : plan->children) {
-		LiftCreateFilterAboveMarkJoin(child);
-	}
-
-	// match: MARK JOIN with BF operators in probe chain
-	if (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		return;
-	}
-	auto &join = plan->Cast<LogicalComparisonJoin>();
-	if (join.join_type != JoinType::MARK) {
-		return;
-	}
-
-	auto &probe_child = plan->children[0];
-	auto *deepest = FindDeepestCreateFilter(probe_child.get());
-	if (!deepest) {
-		return;
-	}
-
-	// detach block from probe chain, place above MARK_JOIN
-	auto below_deepest = std::move(deepest->children[0]);
-	deepest->children.clear();
-	auto block = std::move(probe_child);
-	probe_child = std::move(below_deepest);
-
-	deepest->AddChild(std::move(plan));
-	plan = std::move(block);
+// move the chain so that it sits above `plan`, keeping `plan` and everything between it and
+// the chain in their original relative order:
+//
+//   plan -> .. -> [chain .. deepest_create] -> rest
+//   [chain .. deepest_create] -> plan -> .. -> rest
+//
+// #20's original rewrite moved the FILTER instead, across operators it could not commute
+// with, which is why the order below the lifted block is left strictly alone.
+static void LiftChainAbove(unique_ptr<LogicalOperator> &plan, const LiftableChain &chain) {
+	auto lifted = std::move(*chain.chain_slot);
+	*chain.chain_slot = std::move(chain.deepest_create->children[0]);
+	chain.deepest_create->children[0] = std::move(plan);
+	plan = std::move(lifted);
 }
 
-void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<LogicalOperator> &plan) {
-	if (!plan) {
-		return;
-	}
-	for (auto &child : plan->children) {
-		LiftCreateFilterAboveFilter(child);
-	}
-
-	if (plan->type != LogicalOperatorType::LOGICAL_FILTER) {
-		return;
-	}
-
-	auto p = FindDeepestFilterChain(plan.get());
-	LogicalOperator *parent = p.first;
-	LogicalOperator *create = p.second;
-	if (!parent || !create) {
-		return;
-	}
-
-	// once lifted, the chain's child is the FILTER. CREATE/PROBE_FILTER pass their child's
-	// bindings through, so excising the chain leaves the FILTER's own bindings unchanged and
-	// the new input bindings can be resolved up front, before anything is rewired.
-	auto target_bindings = plan->GetColumnBindings();
-
-	// stage the remapped bindings for every operator that is about to move, i.e. the chain
-	// from its top down to and including the deepest CREATE_FILTER
-	vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> staged;
-	bool reached_create = false;
-	for (auto *cur = parent->children[0].get(); cur;
-	     cur = cur->children.empty() ? nullptr : cur->children[0].get()) {
+// once lifted, a chain operator no longer sees the base scan beneath it but whatever operator
+// it was moved over, so its input bindings have to be rewritten against that new schema -- for
+// the Q18 shape, from (lineitem, l_orderkey) to the aggregate's group output.
+// ResolveColumnBinding can bridge the two because ExtractOperatorsRecursive records
+// rename_col_bindings for PROJECTION, grouped AGGREGATE and BOUND_FUNCTION expressions.
+//
+// a column with no match would leave fewer resolved indices than bloom filters at sink time,
+// so this reports failure instead and the caller leaves the plan untouched.
+bool RobustOptimizerContextState::StageChainRemap(
+    const LiftableChain &chain, const vector<ColumnBinding> &target_bindings,
+    vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> &staged) const {
+	for (auto *cur = chain.chain_slot->get(); cur; cur = cur->children.empty() ? nullptr : cur->children[0].get()) {
 		const vector<ColumnBinding> *base_columns = nullptr;
 		vector<ColumnBinding> *input_bindings = nullptr;
 		if (auto *create_filter = dynamic_cast<LogicalCreateFilter *>(cur)) {
@@ -1779,32 +1752,79 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 					}
 				}
 			}
-			// a column with no place in the new child schema would leave fewer resolved
-			// indices than bloom filters at execution time, so leave the plan alone instead
 			if (remapped.size() != base_columns->size()) {
-				return;
+				return false;
 			}
 			staged.emplace_back(input_bindings, std::move(remapped));
 		}
-		if (cur == create) {
-			reached_create = true;
-			break;
+		if (cur == chain.deepest_create) {
+			return true;
 		}
 	}
-	if (!reached_create) {
-		return;
+	return false;
+}
+
+// stage, validate and only then rewire. the bindings the chain will see are `plan`'s own,
+// which the move leaves untouched because CREATE/PROBE_FILTER pass their child's through.
+static bool TryLiftChain(RobustOptimizerContextState &state, unique_ptr<LogicalOperator> &plan,
+                         const LiftableChain &chain) {
+	vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> staged;
+	if (!state.StageChainRemap(chain, plan->GetColumnBindings(), staged)) {
+		return false;
 	}
-
-	// lift the chain above LOGICAL_FILTER, keeping the FILTER and everything between it and
-	// the chain in their original relative order
-	auto chain = std::move(parent->children[0]);
-	parent->children[0] = std::move(create->children[0]);
-	create->children[0] = std::move(plan);
-	plan = std::move(chain);
-
+	LiftChainAbove(plan, chain);
 	for (auto &entry : staged) {
 		*entry.first = std::move(entry.second);
 	}
+	return true;
+}
+
+void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	for (auto &child : plan->children) {
+		LiftCreateFilterAboveMarkJoin(child);
+	}
+
+	// match: MARK JOIN with BF operators in probe chain
+	if (plan->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return;
+	}
+	auto &join = plan->Cast<LogicalComparisonJoin>();
+	if (join.join_type != JoinType::MARK) {
+		return;
+	}
+
+	// this pass deliberately keeps the stricter search: it only lifts while bindings pass
+	// through unchanged, so the remap is an identity that just confirms every column is still
+	// reachable in the join's output (a left_projection_map can drop one)
+	LiftableChain chain;
+	if (!FindStableBindingChain(plan->children[0], chain)) {
+		return;
+	}
+	TryLiftChain(*this, plan, chain);
+}
+
+void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	for (auto &child : plan->children) {
+		LiftCreateFilterAboveFilter(child);
+	}
+
+	if (plan->type != LogicalOperatorType::LOGICAL_FILTER) {
+		return;
+	}
+
+	// this pass crosses binding-rewriting operators (Q18's GROUP BY ... HAVING puts an
+	// AGGREGATE and a PROJECTION between the FILTER and the chain) and relies on the remap
+	LiftableChain chain;
+	if (!FindFilterChain(plan, chain)) {
+		return;
+	}
+	TryLiftChain(*this, plan, chain);
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<LogicalOperator> plan) {
