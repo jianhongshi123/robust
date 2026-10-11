@@ -1749,35 +1749,61 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 		return;
 	}
 
-	// lift the CREATE/PROBE FILTER chain above LOGICAL_FILTER and remap the column bindings
-	auto beginning = std::move(parent->children[0]);
-	parent->children[0] = std::move(create->children[0]);
-	create->children[0] = (std::move(plan));
-	plan = std::move(beginning);
-	LogicalOperator *cur = plan.get();
-	while (cur->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
-		if (auto *createCur = dynamic_cast<LogicalCreateFilter *>(cur)) {
-			auto &filter = createCur->filter_operation;
-			createCur->input_bindings.clear();
-			for (auto &baseBinding : filter.build_columns) {
-				for (auto &binding : createCur->GetColumnBindings()) {
-					if (ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)) {
-						createCur->input_bindings.push_back(binding);
-					}
-				}
-			}
-		} else if (auto *probeCur = dynamic_cast<LogicalProbeFilter *>(cur)) {
-			auto &filter = probeCur->filter_operation;
-			probeCur->input_bindings.clear();
-			for (auto &baseBinding : filter.probe_columns) {
-				for (auto &binding : probeCur->GetColumnBindings()) {
-					if (ResolveColumnBinding(binding) == ResolveColumnBinding(baseBinding)) {
-						probeCur->input_bindings.push_back(binding);
-					}
-				}
-			}
+	// once lifted, the chain's child is the FILTER. CREATE/PROBE_FILTER pass their child's
+	// bindings through, so excising the chain leaves the FILTER's own bindings unchanged and
+	// the new input bindings can be resolved up front, before anything is rewired.
+	auto target_bindings = plan->GetColumnBindings();
+
+	// stage the remapped bindings for every operator that is about to move, i.e. the chain
+	// from its top down to and including the deepest CREATE_FILTER
+	vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> staged;
+	bool reached_create = false;
+	for (auto *cur = parent->children[0].get(); cur;
+	     cur = cur->children.empty() ? nullptr : cur->children[0].get()) {
+		const vector<ColumnBinding> *base_columns = nullptr;
+		vector<ColumnBinding> *input_bindings = nullptr;
+		if (auto *create_filter = dynamic_cast<LogicalCreateFilter *>(cur)) {
+			base_columns = &create_filter->filter_operation.build_columns;
+			input_bindings = &create_filter->input_bindings;
+		} else if (auto *probe_filter = dynamic_cast<LogicalProbeFilter *>(cur)) {
+			base_columns = &probe_filter->filter_operation.probe_columns;
+			input_bindings = &probe_filter->input_bindings;
 		}
-		cur = cur->children[0].get();
+		if (base_columns) {
+			vector<ColumnBinding> remapped;
+			for (auto &base_binding : *base_columns) {
+				for (auto &binding : target_bindings) {
+					if (ResolveColumnBinding(binding) == ResolveColumnBinding(base_binding)) {
+						remapped.push_back(binding);
+						break;
+					}
+				}
+			}
+			// a column with no place in the new child schema would leave fewer resolved
+			// indices than bloom filters at execution time, so leave the plan alone instead
+			if (remapped.size() != base_columns->size()) {
+				return;
+			}
+			staged.emplace_back(input_bindings, std::move(remapped));
+		}
+		if (cur == create) {
+			reached_create = true;
+			break;
+		}
+	}
+	if (!reached_create) {
+		return;
+	}
+
+	// lift the chain above LOGICAL_FILTER, keeping the FILTER and everything between it and
+	// the chain in their original relative order
+	auto chain = std::move(parent->children[0]);
+	parent->children[0] = std::move(create->children[0]);
+	create->children[0] = std::move(plan);
+	plan = std::move(chain);
+
+	for (auto &entry : staged) {
+		*entry.first = std::move(entry.second);
 	}
 }
 
