@@ -61,6 +61,11 @@ static void RemoveFilterPair(const FilterOpPair &pair,
 
 	// if backward pass, CREATE needs to be partially deleted
 	auto *create_op = FindOperation(filter_ops, pair.create_op.sequence_number);
+	if (!create_op) {
+		// a broadcast CREATE shared with earlier pairs is already gone; drop the PROBE alone
+		EraseOperation(filter_ops, pair.probe_op.sequence_number);
+		return;
+	}
 	for (const auto &target_probe : pair.probe_op.probe_columns) {
 		for (idx_t i = 0; i < create_op->probe_columns.size(); i++) {
 			const auto &current_probe = create_op->probe_columns[i];
@@ -86,13 +91,17 @@ static void RemoveFilterPair(const FilterOpPair &pair,
 
 static unique_ptr<BaseStatistics> GetColumnStatistics(RobustOptimizerContextState &state,
                                                       const ColumnBinding &binding) {
-	auto &table_info = state.table_mgr.table_lookup[binding.table_index];
-	auto *get = TableManager::FindLogicalGet(table_info.table_op);
-	if (!get) {
+	auto resolved_binding = state.ResolveColumnBinding(binding);
+	auto table_it = state.table_mgr.table_lookup.find(resolved_binding.table_index);
+	if (table_it == state.table_mgr.table_lookup.end()) {
+		return nullptr;
+	}
+	auto *get = TableManager::FindLogicalGet(table_it->second.table_op);
+	if (!get || resolved_binding.column_index >= get->GetColumnIds().size()) {
 		D_PRINTF("No matching base table found");
 		return nullptr;
 	}
-	auto &column_id = get->GetColumnIds()[binding.column_index];
+	auto &column_id = get->GetColumnIds()[resolved_binding.column_index];
 
 	if (!get->function.statistics && !get->function.statistics_extended) {
 		return nullptr;
@@ -232,8 +241,12 @@ static void TightenWithLocalPredicate(RobustOptimizerContextState &state, const 
 		return;
 	}
 	auto resolved = state.ResolveColumnBinding(binding);
-	auto *get = TableManager::FindLogicalGet(state.table_mgr.table_lookup[resolved.table_index].table_op);
-	if (!get) {
+	auto table_it = state.table_mgr.table_lookup.find(resolved.table_index);
+	if (table_it == state.table_mgr.table_lookup.end()) {
+		return;
+	}
+	auto *get = TableManager::FindLogicalGet(table_it->second.table_op);
+	if (!get || resolved.column_index >= get->GetColumnIds().size()) {
 		D_PRINTF("No matching base table found");
 		return;
 	}
@@ -251,12 +264,21 @@ static bool HasFilteringLocalPredicate(RobustOptimizerContextState &state, const
 	const auto &probe_columns = pair_op.probe_columns;
 	auto build_table_idx = pair_op.build_table_idx;
 
+	// build_columns[i] pairs with probe_columns[i]; a broadcast CREATE can carry more build
+	// columns than this edge has probe columns, and we cannot pair them up. treat as filtered
+	if (build_columns.size() != probe_columns.size()) {
+		return true;
+	}
+
 	if (state.table_with_filters.count(build_table_idx)) {
 		return true;
 	}
 
-	auto &table_info = state.table_mgr.table_lookup[build_table_idx];
-	auto *get = TableManager::FindLogicalGet(table_info.table_op);
+	auto table_it = state.table_mgr.table_lookup.find(build_table_idx);
+	if (table_it == state.table_mgr.table_lookup.end()) {
+		return true;
+	}
+	auto *get = TableManager::FindLogicalGet(table_it->second.table_op);
 	if (!get) {
 		D_PRINTF("No matching base table found");
 		return true;
@@ -325,6 +347,13 @@ static bool IsRedundant(RobustOptimizerContextState &state, const FilterOpPair &
 	const auto &build_columns = pair.probe_op.build_columns;
 	const auto &probe_columns = pair.probe_op.probe_columns;
 
+	// see HasFilteringLocalPredicate: unpairable columns mean we cannot reason about the pair
+	if (build_columns.empty() || build_columns.size() != probe_columns.size()) {
+		return false;
+	}
+
+	// every column carries its own bloom filter and removal drops all of them, so the pair is
+	// redundant only if none of them can reject anything
 	for (idx_t i = 0; i < build_columns.size(); ++i) {
 		auto build_stats = GetColumnStatistics(state, build_columns[i]);
 		auto probe_stats = GetColumnStatistics(state, probe_columns[i]);
@@ -354,14 +383,13 @@ static bool IsRedundant(RobustOptimizerContextState &state, const FilterOpPair &
 		bool redundant_by_row_count =
 		    build_row_count != DConstants::INVALID_INDEX && build_row_count == static_cast<idx_t>(build_range);
 		if (redundant_by_row_count) {
-			return true;
+			continue;
 		}
-		bool redundant_by_hll = HLLDominates(state, build_columns[i], probe_columns[i]);
-		if (redundant_by_hll) {
-			return true;
+		if (!HLLDominates(state, build_columns[i], probe_columns[i])) {
+			return false;
 		}
 	}
-	return false;
+	return true;
 }
 
 void RemoveRedundantPairs(RobustOptimizerContextState &state, vector<FilterOpPair> &filter_pairs,
