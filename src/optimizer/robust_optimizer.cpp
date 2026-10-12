@@ -215,8 +215,29 @@ ColumnBinding RobustOptimizerContextState::ResolveColumnBinding(const ColumnBind
 	return current;
 }
 
+static idx_t TableUFFind(unordered_map<idx_t, idx_t> &parent, idx_t x) {
+	if (parent.find(x) == parent.end()) {
+		parent[x] = x;
+	}
+	while (parent[x] != x) {
+		parent[x] = parent[parent[x]];
+		x = parent[x];
+	}
+	return x;
+}
+
+static void TableUFUnion(unordered_map<idx_t, idx_t> &parent, idx_t a, idx_t b) {
+	a = TableUFFind(parent, a);
+	b = TableUFFind(parent, b);
+	if (a != b) {
+		parent[a] = b;
+	}
+}
+
 vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOperator *> &join_ops) {
 	vector<JoinEdge> edges;
+	unordered_map<idx_t, idx_t> table_parent;
+	set<pair<idx_t, idx_t>> seen_pairs;
 	for (auto &op : join_ops) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
 
@@ -255,6 +276,24 @@ vector<JoinEdge> RobustOptimizerContextState::CreateJoinEdges(vector<LogicalOper
 			} else {
 				D_PRINTF("WARNING: Resolved table indices (%llu, %llu) not found in table_lookup",
 				         (unsigned long long)left_table_idx, (unsigned long long)right_table_idx);
+				continue;
+			}
+			// record whether the join graph is cyclic without short-circuiting, so the
+			// returned edge list stays complete regardless of where a cycle shows up
+			for (idx_t i = 0; i < resolved_left_columns.size(); i++) {
+				auto u = resolved_left_columns[i].table_index;
+				auto v = resolved_right_columns[i].table_index;
+				if (u > v) {
+					std::swap(u, v);
+				}
+				if (!seen_pairs.count({u, v})) {
+					if (TableUFFind(table_parent, u) == TableUFFind(table_parent, v)) {
+						exist_cycle = true;
+					} else {
+						seen_pairs.insert({u, v});
+						TableUFUnion(table_parent, u, v);
+					}
+				}
 			}
 		}
 	}
@@ -1649,23 +1688,137 @@ void RobustOptimizerContextState::SetupDynamicFilterPushdown(LogicalOperator *pl
 	}
 }
 
-// find the deepest CREATE_FILTER in a linear chain (following child[0])
-static LogicalOperator *FindDeepestCreateFilter(LogicalOperator *node) {
-	LogicalOperator *deepest = nullptr;
-	while (node) {
-		if (node->children.empty()) {
-			break;
-		}
+// DELIM_JOIN and MATERIALIZED_CTE bindings are paired with DELIM_GET / CTE_REF placeholders
+// deeper in the plan, so a chain must never be moved across one
+static bool IsLiftBarrier(const LogicalOperator &op) {
+	return op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
+}
+
+// walk the single-child spine from `slot` for as long as bindings pass through unchanged, and
+// report the run ending at the deepest CREATE_FILTER. the run starts at `slot` itself, so any
+// binding-transparent operators sitting above that CREATE_FILTER move along with it.
+static bool FindStableBindingChain(unique_ptr<LogicalOperator> &slot, LiftableChain &result) {
+	LogicalOperator *deepest_create = nullptr;
+	for (auto *node = slot.get(); node; node = node->children[0].get()) {
 		if (node->children.size() != 1 || node->GetColumnBindings() != node->children[0]->GetColumnBindings()) {
 			break;
 		}
 		if (node->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
 		    dynamic_cast<LogicalCreateFilter *>(node)) {
-			deepest = node;
+			deepest_create = node;
 		}
-		node = node->children[0].get();
 	}
-	return deepest;
+	if (!deepest_create) {
+		return false;
+	}
+	result = {&slot, deepest_create};
+	return true;
+}
+
+// walk the single-child spine below `plan` until a run of CREATE/PROBE_FILTER operators is
+// found, and report that run up to its deepest CREATE_FILTER. unlike the stable-binding
+// search this crosses operators that rewrite bindings, so the caller has to remap afterwards.
+static bool FindFilterChain(unique_ptr<LogicalOperator> &plan, LiftableChain &result) {
+	for (auto *node = plan.get(); node;) {
+		if (node->children.size() != 1 || IsLiftBarrier(*node->children[0])) {
+			return false;
+		}
+		auto *chain_slot = &node->children[0];
+		if ((*chain_slot)->type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			node = chain_slot->get();
+			continue;
+		}
+		LogicalOperator *deepest_create = nullptr;
+		for (auto *scan = chain_slot->get(); scan->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
+		     scan = scan->children[0].get()) {
+			if (scan->children.size() != 1 || IsLiftBarrier(*scan->children[0])) {
+				break;
+			}
+			if (dynamic_cast<LogicalCreateFilter *>(scan)) {
+				deepest_create = scan;
+			}
+		}
+		if (!deepest_create) {
+			return false;
+		}
+		result = {chain_slot, deepest_create};
+		return true;
+	}
+	return false;
+}
+
+// move the chain so that it sits above `plan`, keeping `plan` and everything between it and
+// the chain in their original relative order:
+//
+//   plan -> .. -> [chain .. deepest_create] -> rest
+//   [chain .. deepest_create] -> plan -> .. -> rest
+//
+// #20's original rewrite moved the FILTER instead, across operators it could not commute
+// with, which is why the order below the lifted block is left strictly alone.
+static void LiftChainAbove(unique_ptr<LogicalOperator> &plan, const LiftableChain &chain) {
+	auto lifted = std::move(*chain.chain_slot);
+	*chain.chain_slot = std::move(chain.deepest_create->children[0]);
+	chain.deepest_create->children[0] = std::move(plan);
+	plan = std::move(lifted);
+}
+
+// once lifted, a chain operator no longer sees the base scan beneath it but whatever operator
+// it was moved over, so its input bindings have to be rewritten against that new schema -- for
+// the Q18 shape, from (lineitem, l_orderkey) to the aggregate's group output.
+// ResolveColumnBinding can bridge the two because ExtractOperatorsRecursive records
+// rename_col_bindings for PROJECTION, grouped AGGREGATE and BOUND_FUNCTION expressions.
+//
+// a column with no match would leave fewer resolved indices than bloom filters at sink time,
+// so this reports failure instead and the caller leaves the plan untouched.
+bool RobustOptimizerContextState::StageChainRemap(
+    const LiftableChain &chain, const vector<ColumnBinding> &target_bindings,
+    vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> &staged) const {
+	for (auto *cur = chain.chain_slot->get(); cur; cur = cur->children.empty() ? nullptr : cur->children[0].get()) {
+		const vector<ColumnBinding> *base_columns = nullptr;
+		vector<ColumnBinding> *input_bindings = nullptr;
+		if (auto *create_filter = dynamic_cast<LogicalCreateFilter *>(cur)) {
+			base_columns = &create_filter->filter_operation.build_columns;
+			input_bindings = &create_filter->input_bindings;
+		} else if (auto *probe_filter = dynamic_cast<LogicalProbeFilter *>(cur)) {
+			base_columns = &probe_filter->filter_operation.probe_columns;
+			input_bindings = &probe_filter->input_bindings;
+		}
+		if (base_columns) {
+			vector<ColumnBinding> remapped;
+			for (auto &base_binding : *base_columns) {
+				for (auto &binding : target_bindings) {
+					if (ResolveColumnBinding(binding) == ResolveColumnBinding(base_binding)) {
+						remapped.push_back(binding);
+						break;
+					}
+				}
+			}
+			if (remapped.size() != base_columns->size()) {
+				return false;
+			}
+			staged.emplace_back(input_bindings, std::move(remapped));
+		}
+		if (cur == chain.deepest_create) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// stage, validate and only then rewire. the bindings the chain will see are `plan`'s own,
+// which the move leaves untouched because CREATE/PROBE_FILTER pass their child's through.
+static bool TryLiftChain(RobustOptimizerContextState &state, unique_ptr<LogicalOperator> &plan,
+                         const LiftableChain &chain) {
+	vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> staged;
+	if (!state.StageChainRemap(chain, plan->GetColumnBindings(), staged)) {
+		return false;
+	}
+	LiftChainAbove(plan, chain);
+	for (auto &entry : staged) {
+		*entry.first = std::move(entry.second);
+	}
+	return true;
 }
 
 void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<LogicalOperator> &plan) {
@@ -1685,20 +1838,14 @@ void RobustOptimizerContextState::LiftCreateFilterAboveMarkJoin(unique_ptr<Logic
 		return;
 	}
 
-	auto &probe_child = plan->children[0];
-	auto *deepest = FindDeepestCreateFilter(probe_child.get());
-	if (!deepest) {
+	// this pass deliberately keeps the stricter search: it only lifts while bindings pass
+	// through unchanged, so the remap is an identity that just confirms every column is still
+	// reachable in the join's output (a left_projection_map can drop one)
+	LiftableChain chain;
+	if (!FindStableBindingChain(plan->children[0], chain)) {
 		return;
 	}
-
-	// detach block from probe chain, place above MARK_JOIN
-	auto below_deepest = std::move(deepest->children[0]);
-	deepest->children.clear();
-	auto block = std::move(probe_child);
-	probe_child = std::move(below_deepest);
-
-	deepest->AddChild(std::move(plan));
-	plan = std::move(block);
+	TryLiftChain(*this, plan, chain);
 }
 
 void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<LogicalOperator> &plan) {
@@ -1713,19 +1860,13 @@ void RobustOptimizerContextState::LiftCreateFilterAboveFilter(unique_ptr<Logical
 		return;
 	}
 
-	auto *deepest = FindDeepestCreateFilter(plan->children[0].get());
-	if (!deepest) {
+	// this pass crosses binding-rewriting operators (Q18's GROUP BY ... HAVING puts an
+	// AGGREGATE and a PROJECTION between the FILTER and the chain) and relies on the remap
+	LiftableChain chain;
+	if (!FindFilterChain(plan, chain)) {
 		return;
 	}
-
-	// same block-detach logic as LiftCreateFilterAboveMarkJoin
-	auto below_deepest = std::move(deepest->children[0]);
-	deepest->children.clear();
-	auto block = std::move(plan->children[0]);
-	plan->children[0] = std::move(below_deepest);
-
-	deepest->AddChild(std::move(plan));
-	plan = std::move(block);
+	TryLiftChain(*this, plan, chain);
 }
 
 static FilterOperation *FindOperation(unordered_map<LogicalOperator *, vector<FilterOperation>> &filter_ops,
@@ -2138,11 +2279,18 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::PreOptimize(unique_ptr<
 }
 
 unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<LogicalOperator> plan) {
+	exist_cycle = false;
+
 	// step 1: extract join operators
 	vector<JoinEdge> edges = ExtractOperators(*plan);
 
 	D_PRINTF("Edges size: %zu", edges.size());
 	if (edges.size() <= 1) {
+		return plan;
+	}
+
+	if (exist_cycle) {
+		D_PRINTF("Cycle Detected");
 		return plan;
 	}
 

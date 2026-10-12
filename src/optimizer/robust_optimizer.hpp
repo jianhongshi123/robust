@@ -55,6 +55,12 @@ struct PhysicalDAGComponent {
 // column key for equivalence class union-find
 using ColKey = std::pair<idx_t, idx_t>; // (table_idx, column_idx)
 
+// a run of CREATE/PROBE_FILTER operators that can be moved as one block
+struct LiftableChain {
+	unique_ptr<LogicalOperator> *chain_slot; // the slot the run currently hangs from
+	LogicalOperator *deepest_create;         // deepest CREATE_FILTER in the run; the block ends here
+};
+
 class RobustOptimizerContextState : public ClientContextState {
 public:
 	explicit RobustOptimizerContextState(ClientContext &ctx) : context(ctx) {
@@ -129,6 +135,11 @@ public:
 
 	// pass 2: lift BF operator block above FILTER (handles all FILTER cases)
 	void LiftCreateFilterAboveFilter(unique_ptr<LogicalOperator> &plan);
+
+	// resolve each moved operator's input bindings against the schema it will see after the
+	// lift. returns false if any column has no match, in which case the lift must be skipped
+	bool StageChainRemap(const LiftableChain &chain, const vector<ColumnBinding> &target_bindings,
+	                     vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> &staged) const;
 
 	unique_ptr<BaseStatistics> GetColumnStatistics(const ColumnBinding &binding);
 

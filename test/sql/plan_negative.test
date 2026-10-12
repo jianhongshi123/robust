@@ -144,6 +144,46 @@ AND t2.k23 = t3.k23;
 ----
 physical_plan	<!REGEX>:.*PROBE_FILTER.*
 
+# Negative: cyclic join graph (triangle) - predicate transfer bails out entirely
+query II
+EXPLAIN SELECT count(*)
+FROM t2, t3, t4
+WHERE t2.k23 = t3.k23
+  AND t3.k34 = t4.k34
+  AND t2.k24 = t4.k24;
+----
+physical_plan	<!REGEX>:.*CREATE_FILTER.*
+
+query II
+EXPLAIN SELECT count(*)
+FROM t2, t3, t4
+WHERE t2.k23 = t3.k23
+  AND t3.k34 = t4.k34
+  AND t2.k24 = t4.k24;
+----
+physical_plan	<!REGEX>:.*PROBE_FILTER.*
+
+# Negative: cyclic join graph (4-cycle, TPC-H Q5 shape)
+query II
+EXPLAIN SELECT count(*)
+FROM t1, t2, t3, t4
+WHERE t1.k12 = t2.k12
+  AND t2.k23 = t3.k23
+  AND t3.k34 = t4.k34
+  AND t1.k14 = t4.k14;
+----
+physical_plan	<!REGEX>:.*CREATE_FILTER.*
+
+query II
+EXPLAIN SELECT count(*)
+FROM t1, t2, t3, t4
+WHERE t1.k12 = t2.k12
+  AND t2.k23 = t3.k23
+  AND t3.k34 = t4.k34
+  AND t1.k14 = t4.k14;
+----
+physical_plan	<!REGEX>:.*PROBE_FILTER.*
+
 endloop
 
 endloop

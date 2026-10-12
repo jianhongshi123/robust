@@ -1,0 +1,56 @@
+# name: test/sql/lift_above_filter.test
+# group: [sql]
+
+# the CREATE/PROBE chain is lifted above a FILTER so the bloom filter is built from the
+# filtered output rather than the raw scan. the shape that matters is TPC-H Q18's:
+# GROUP BY ... HAVING leaves an AGGREGATE and a PROJECTION between the FILTER and the
+# chain, and those change column bindings, which used to block the lift entirely.
+
+statement ok
+LOAD 'build/release/extension/robust/robust.duckdb_extension';
+
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown';
+
+statement ok
+SET robust_pass_mode = 'forward_only';
+
+statement ok
+CREATE TABLE cust AS SELECT i AS ck FROM range(100) t(i);
+
+statement ok
+CREATE TABLE ord AS SELECT i AS ok, i%100 AS ck FROM range(500) t(i);
+
+statement ok
+CREATE TABLE li AS SELECT i%500 AS ok, i AS qty FROM range(2000) t(i);
+
+foreach heuristic join_order largest_root
+
+statement ok
+SET robust_heuristic = '${heuristic}';
+
+# a CREATE_FILTER has to end up above the HAVING FILTER. the json plan nests children after
+# their parent, so textual order implies ancestry, and the bounded gap is what makes the
+# match precise: the lifted CREATE_FILTER sits ~370 characters from the FILTER, while the
+# nearest CREATE_FILTER on any other join branch is more than 3700 away.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM cust, ord, li
+WHERE ord.ok IN (SELECT ok FROM li GROUP BY ok HAVING sum(qty) > 10)
+  AND cust.ck = ord.ck
+  AND ord.ok = li.ok;
+----
+physical_plan	<REGEX>:.*"name": "CREATE_FILTER",.{0,800}?"name": "FILTER",.*
+
+# and the lifted plan still answers correctly
+query I
+SELECT count(*)
+FROM cust, ord, li
+WHERE ord.ok IN (SELECT ok FROM li GROUP BY ok HAVING sum(qty) > 10)
+  AND cust.ck = ord.ck
+  AND ord.ok = li.ok;
+----
+2000
+
+endloop
