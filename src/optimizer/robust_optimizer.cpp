@@ -1926,8 +1926,14 @@ unique_ptr<LogicalOperator> RobustOptimizerContextState::Optimize(unique_ptr<Log
 		forward_filter_ops = std::move(filter_ops.first);
 		backward_filter_ops = std::move(filter_ops.second);
 
-		RemoveRedundantPairs(*this, filter_pairs, forward_filter_ops, backward_filter_ops);
-
+		Value remove_val;
+		bool remove_redundant = true;
+		if (context.TryGetCurrentSetting("robust_remove_redundant_pairs", remove_val)) {
+			remove_redundant = remove_val.GetValue<bool>();
+		}
+		if (remove_redundant) {
+			RemoveRedundantPairs(*this, filter_pairs, forward_filter_ops, backward_filter_ops);
+		}
 	} else {
 		// largest_root
 		mst_edges = LargestRoot(edges);
