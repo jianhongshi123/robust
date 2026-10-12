@@ -7,7 +7,6 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/common/types/hyperloglog.hpp"
 
 namespace duckdb {
 
@@ -140,24 +139,6 @@ public:
 	// lift. returns false if any column has no match, in which case the lift must be skipped
 	bool StageChainRemap(const LiftableChain &chain, const vector<ColumnBinding> &target_bindings,
 	                     vector<std::pair<vector<ColumnBinding> *, vector<ColumnBinding>>> &staged) const;
-
-	unique_ptr<BaseStatistics> GetColumnStatistics(const ColumnBinding &binding);
-
-	idx_t GetBaseTableRowCount(const ColumnBinding &binding);
-
-	unique_ptr<HyperLogLog> GetColumnHLL(const ColumnBinding &binding);
-
-	bool HLLDominates(const ColumnBinding &build_binding, const ColumnBinding &probe_binding);
-
-	void TightenWithLocalPredicate(const ColumnBinding &binding, BaseStatistics &stats);
-
-	bool HasFilteringLocalPredicate(const FilterOpPair &pair);
-
-	bool IsRedundant(const FilterOpPair &pair);
-
-	void RemoveRedundantPairs(vector<FilterOpPair> &filter_pairs,
-	                          unordered_map<LogicalOperator *, vector<FilterOperation>> &forward_filter_ops,
-	                          unordered_map<LogicalOperator *, vector<FilterOperation>> &backward_filter_ops);
 
 	// resolve column binding through rename chain to get base table binding
 	ColumnBinding ResolveColumnBinding(const ColumnBinding &binding) const;
