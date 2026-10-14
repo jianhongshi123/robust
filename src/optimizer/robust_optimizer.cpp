@@ -94,10 +94,6 @@ void RobustOptimizerContextState::ExtractOperatorsRecursive(LogicalOperator &pla
 					if (join.join_type != JoinType::MARK) {
 						break;
 					}
-				} else if (current->children.size() == 1) {
-					if (current->type == LogicalOperatorType::LOGICAL_GET) {
-						break;
-					}
 				}
 				current = current->children[0].get();
 			}
