@@ -1,10 +1,10 @@
 # Robust
 
 [![CI](https://github.com/robust-sql/robust/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/robust-sql/robust/actions/workflows/MainDistributionPipeline.yml)
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.3-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.3)
-[![extension-ci-tools](https://img.shields.io/badge/extension--ci--tools-v1.5.3-blue)](https://github.com/duckdb/extension-ci-tools/tree/v1.5.3)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v2.0.0-blue)](https://github.com/duckdb/duckdb/releases/tag/v2.0.0)
+[![extension-ci-tools](https://img.shields.io/badge/extension--ci--tools-v2.0--cyanoptera-blue)](https://github.com/duckdb/extension-ci-tools/tree/v2.0-cyanoptera)
 [![status](https://img.shields.io/badge/status-WIP-orange)](#current-status)
-<!-- JOB performance badges (geomean speedup, memory ratio) removed pending re-measurement on DuckDB v1.5.3. -->
+<!-- JOB performance badges (geomean speedup, memory ratio) removed pending re-measurement on DuckDB v2.0.0. -->
 <!-- [![JOB speedup](https://img.shields.io/badge/JOB_geomean-1.76×-brightgreen)](#benchmark-results) -->
 <!-- [![JOB memory](https://img.shields.io/badge/JOB_memory-1.67×_lower-brightgreen)](#benchmark-results) -->
 
@@ -268,7 +268,7 @@ Output: `benchmark_results/{baseline_raw.tsv, robust_raw.tsv, comparison.tsv}`.
 1. **Build DAG.** The optimizer extracts equality joins, builds equivalence classes over join columns (union-find), and constructs a DAG over base tables with filtered tables as roots.
 2. **Forward pass (leaves → root).** For each edge, the smaller side builds a filter (bloom filter + min/max + optional `IN`-list when the build side has few distinct values). The filter is applied to the larger side via a `PROBE_FILTER` operator inserted above the scan.
 3. **Backward pass (root → leaves).** Each filter is broadcast across its equivalence class. If tables A, B, C all join on the same key and a filter was built from C, it's pushed to A and B as well — even though they never directly joined with C.
-4. **Scan pushdown.** Built filters are pushed into DuckDB's `dynamic_filters` infrastructure via `BFTableFilter` + `SelectivityOptionalFilter`, so the scan can skip rows/segments before they're decompressed.
+4. **Scan pushdown.** Built filters are pushed into DuckDB's `dynamic_filters` infrastructure via `ExpressionFilter` expressions, allowing scans to prune rows and data segments. Scan-side Bloom filters remain active throughout the scan; adaptive pausing based on selectivity is disabled.
 
 
 ## Bloom filter implementation
@@ -285,14 +285,14 @@ The extension uses DuckDB's native [`BloomFilter`](duckdb/src/include/duckdb/pla
 - `ReinitializeAndRehash(actual_rows, data, cols)` — resizes the filter once the true build-side row count is known.
 - `IsEmpty()` / `finalized_` — lifecycle flags read by `PhysicalProbeFilter`.
 
-The bloom filter is one of three filter types pushed in a single `CREATE_FILTER` operation; min/max bounds and `IN`-lists (when the build side has ≤ 50 distinct keys) are emitted alongside it via DuckDB's `ConstantFilter` / `InFilter` infrastructure.
+The bloom filter is one of three filter types pushed in a single `CREATE_FILTER` operation; min/max bounds and `IN`-lists (when the build side has ≤ 50 distinct keys) are emitted alongside it via DuckDB's `ExpressionFilter` infrastructure.
 
 ## Pinned dependencies
 
 | Dependency | Pin | Notes |
 |---|---|---|
-| `duckdb` submodule | [`v1.5.3`](https://github.com/duckdb/duckdb/releases/tag/v1.5.3) | release tag |
-| `extension-ci-tools` submodule | [`v1.5.3`](https://github.com/duckdb/extension-ci-tools/tree/v1.5.3) | `v1.5.3` branch tip |
+| `duckdb` submodule | [`v2.0.0`](https://github.com/duckdb/duckdb/releases/tag/v2.0.0) | release tag |
+| `extension-ci-tools` submodule | [`v2.0-cyanoptera`](https://github.com/duckdb/extension-ci-tools/tree/v2.0-cyanoptera) | pinned commit on the DuckDB 2.0 tooling branch |
 | OpenSSL | 3.5.3+ via vcpkg | dependency of DuckDB build |
 
 CI pins are kept in sync with submodule pins in [`.github/workflows/MainDistributionPipeline.yml`](.github/workflows/MainDistributionPipeline.yml).
